@@ -62,6 +62,26 @@ impl PlaneDamageClips {
     }
 }
 
+fn clip_nonempty(r: &drm_ffi::drm_mode_rect) -> bool {
+    r.x1 < r.x2 && r.y1 < r.y2
+}
+
+#[cfg(test)]
+mod clip_tests {
+    use super::clip_nonempty;
+    use drm_ffi::drm_mode_rect;
+
+    #[test]
+    fn empty_clips_are_dropped() {
+        let r = |x1, y1, x2, y2| drm_mode_rect { x1, y1, x2, y2 };
+        assert!(clip_nonempty(&r(463, 900, 1456, 970)));
+        assert!(!clip_nonempty(&r(463, 970, 1456, 970)), "zero height");
+        assert!(!clip_nonempty(&r(463, 900, 463, 970)), "zero width");
+        assert!(!clip_nonempty(&r(10, 10, 5, 20)), "inverted");
+        assert!(!clip_nonempty(&r(0, 0, 0, 0)));
+    }
+}
+
 impl PlaneDamageClips {
     /// Initialize damage clips for a a plane
     #[profiling::function]
@@ -97,6 +117,7 @@ impl PlaneDamageClips {
                     y2: rect.loc.y.saturating_add(rect.size.h),
                 }
             })
+            .filter(clip_nonempty)
             .collect::<Vec<_>>();
 
         if rects.is_empty() {

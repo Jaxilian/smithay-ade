@@ -2745,6 +2745,16 @@ where
         self.surface.use_vrr(vrr).map_err(FrameError::DrmError)
     }
 
+    /// Sets extra connector properties for the next frame, see [`DrmSurface::set_connector_properties`].
+    ///
+    /// A change makes the next frame a full commit.
+    pub fn set_connector_properties(
+        &mut self,
+        props: Vec<(&'static str, drm::control::property::RawValue)>,
+    ) -> FrameResult<(), A, F> {
+        self.surface.set_connector_properties(props).map_err(FrameError::DrmError)
+    }
+
     /// Set the [`DebugFlags`] to use
     ///
     /// Note: This will reset the primary plane swapchain if

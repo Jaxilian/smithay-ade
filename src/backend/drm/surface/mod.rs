@@ -372,6 +372,32 @@ impl DrmSurface {
         }
     }
 
+    /// Extra connector properties carried by every full commit, by name and raw value.
+    pub fn connector_properties(&self) -> Vec<(&'static str, drm::control::property::RawValue)> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.connector_properties(),
+            DrmSurfaceInternal::Legacy(_) => Vec::new(),
+        }
+    }
+
+    /// Sets the extra connector properties for the next commit, such as `Colorspace`
+    /// and `HDR_OUTPUT_METADATA`; a name a connector lacks is [`Error::UnknownProperty`].
+    pub fn set_connector_properties(
+        &self,
+        props: Vec<(&'static str, drm::control::property::RawValue)>,
+    ) -> Result<(), Error> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.set_connector_properties(props),
+            DrmSurfaceInternal::Legacy(_) => match props.first() {
+                Some((name, _)) => Err(Error::UnknownProperty {
+                    handle: self.crtc.into(),
+                    name,
+                }),
+                None => Ok(()),
+            },
+        }
+    }
+
     /// Disables the given plane.
     ///
     /// Errors if the plane is not supported by this crtc or if the underlying

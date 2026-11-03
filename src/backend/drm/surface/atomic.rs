@@ -44,6 +44,7 @@ pub struct State {
     pub blob: property::Value<'static>,
     pub vrr: bool,
     pub connectors: HashSet<connector::Handle>,
+    pub conn_props: Vec<(&'static str, property::RawValue)>,
 }
 
 impl PartialEq for State {
@@ -53,6 +54,7 @@ impl PartialEq for State {
             && self.mode == other.mode
             && self.vrr == other.vrr
             && self.connectors == other.connectors
+            && self.conn_props == other.conn_props
     }
 }
 
@@ -150,6 +152,7 @@ impl State {
             // If we don't know the VRR state, the driver doesn't support the property
             vrr: vrr.unwrap_or(false),
             connectors: current_connectors,
+            conn_props: Vec::new(),
         })
     }
 
@@ -159,6 +162,7 @@ impl State {
         self.connectors.clear();
         self.active = false;
         self.vrr = false;
+        self.conn_props.clear();
     }
 }
 
@@ -207,6 +211,7 @@ impl AtomicDrmSurface {
             blob,
             vrr: false,
             connectors: connectors.iter().copied().collect(),
+            conn_props: Vec::new(),
         };
 
         drop(_guard);
@@ -363,6 +368,7 @@ impl AtomicDrmSurface {
                 Some(pending.blob),
                 pending.vrr,
                 &connectors,
+                &pending.conn_props,
                 [],
                 [&plane_state],
             )?;
@@ -422,6 +428,7 @@ impl AtomicDrmSurface {
             Some(pending.blob),
             pending.vrr,
             &connectors,
+            &pending.conn_props,
             [&conn],
             [&plane_state],
         )?;
@@ -479,6 +486,7 @@ impl AtomicDrmSurface {
             Some(pending.blob),
             pending.vrr,
             &conns,
+            &pending.conn_props,
             removed,
             [&plane_state],
         )?;
@@ -533,6 +541,7 @@ impl AtomicDrmSurface {
             Some(new_blob),
             pending.vrr,
             pending.connectors.iter(),
+            &pending.conn_props,
             [],
             [&plane_state],
         )?;
@@ -656,6 +665,7 @@ impl AtomicDrmSurface {
             Some(pending.blob),
             value,
             &pending.connectors,
+            &pending.conn_props,
             &[],
             [&plane_config],
         )?;
@@ -682,6 +692,25 @@ impl AtomicDrmSurface {
             .map_err(|_| Error::TestFailed(self.crtc))?;
 
         pending.vrr = value;
+        Ok(())
+    }
+
+    pub fn connector_properties(&self) -> Vec<(&'static str, property::RawValue)> {
+        self.pending.read().unwrap().conn_props.clone()
+    }
+
+    pub fn set_connector_properties(
+        &self,
+        props: Vec<(&'static str, property::RawValue)>,
+    ) -> Result<(), Error> {
+        let mut pending = self.pending.write().unwrap();
+        let prop_mapping = self.prop_mapping.read().unwrap();
+        for conn in pending.connectors.iter() {
+            for (name, _) in &props {
+                prop_mapping.conn_prop_handle(*conn, name)?;
+            }
+        }
+        pending.conn_props = props;
         Ok(())
     }
 
@@ -726,6 +755,7 @@ impl AtomicDrmSurface {
             Some(pending.blob),
             pending.vrr,
             &pending_conns,
+            &pending.conn_props,
             removed,
             &*planes,
         )?;
@@ -798,6 +828,7 @@ impl AtomicDrmSurface {
                 Some(pending.blob),
                 pending.vrr,
                 &pending_conns,
+                &pending.conn_props,
                 removed,
                 &*planes,
             )?;
@@ -885,6 +916,7 @@ impl AtomicDrmSurface {
             None,
             self.state.read().unwrap().vrr,
             [],
+            &[],
             [],
             &*planes,
         )?;
@@ -1146,6 +1178,18 @@ impl<'a> AtomicRequest<'a> {
         Ok(())
     }
 
+    fn set_connector_prop(
+        &mut self,
+        conn: connector::Handle,
+        name: &'static str,
+        value: property::RawValue,
+    ) -> Result<(), Error> {
+        self.mapping.conn_prop_handle(conn, name)?;
+        let connector_props = self.connector_props.entry(conn).or_default();
+        connector_props.insert(name, property::Value::Unknown(value));
+        Ok(())
+    }
+
     fn reset_connector(&mut self, conn: connector::Handle) -> Result<(), Error> {
         let connector_props = self.connector_props.entry(conn).or_default();
         connector_props.insert("CRTC_ID", property::Value::CRTC(None));
@@ -1341,6 +1385,20 @@ impl<'a> AtomicRequest<'a> {
             conn,
             self.mapping.conn_prop_handle(conn, "CRTC_ID")?,
             property::Value::CRTC(Some(crtc)),
+        );
+        Ok(())
+    }
+
+    fn set_connector_prop(
+        &mut self,
+        conn: connector::Handle,
+        name: &'static str,
+        value: property::RawValue,
+    ) -> Result<(), Error> {
+        self.request.add_property(
+            conn,
+            self.mapping.conn_prop_handle(conn, name)?,
+            property::Value::Unknown(value),
         );
         Ok(())
     }
@@ -1613,6 +1671,7 @@ impl<'a> AtomicRequest<'a> {
         blob: Option<property::Value<'static>>,
         vrr: bool,
         connectors: impl IntoIterator<Item = &'a connector::Handle>,
+        conn_props: &[(&'static str, property::RawValue)],
         removed_connectors: impl IntoIterator<Item = &'a connector::Handle>,
         planes: impl IntoIterator<Item = &'a PlaneState<'a>>,
     ) -> Result<AtomicRequest<'a>, Error> {
@@ -1624,6 +1683,9 @@ impl<'a> AtomicRequest<'a> {
         // for every connector that is new, we need to set our crtc_id
         for conn in connectors {
             req.set_connector(*conn, crtc)?;
+            for (name, value) in conn_props {
+                req.set_connector_prop(*conn, name, *value)?;
+            }
         }
 
         // for every connector that got removed, we need to set no crtc_id.
@@ -1673,5 +1735,71 @@ mod test {
         let geometry: Rectangle<f64, Physical> = Rectangle::from_size((1920.1, 1080.0).into());
         let fixed = to_fixed(geometry.size.w) as u64;
         assert_eq!(125835674, fixed);
+    }
+
+    #[cfg(debug_assertions)]
+    mod conn_props {
+        use std::collections::HashMap;
+
+        use drm::control::{connector, crtc, from_u32, property};
+
+        use super::super::AtomicRequest;
+        use crate::backend::drm::{device::atomic::PropMapping, error::Error};
+
+        fn mapping(conn: connector::Handle, crtc: crtc::Handle) -> PropMapping {
+            let prop = |n: u32| from_u32::<property::Handle>(n).unwrap();
+            let mut conns = HashMap::new();
+            conns.insert(
+                conn,
+                HashMap::from([
+                    ("CRTC_ID".to_string(), prop(1)),
+                    ("Colorspace".to_string(), prop(2)),
+                    ("HDR_OUTPUT_METADATA".to_string(), prop(3)),
+                ]),
+            );
+            let mut crtcs = HashMap::new();
+            crtcs.insert(
+                crtc,
+                HashMap::from([("ACTIVE".to_string(), prop(4)), ("MODE_ID".to_string(), prop(5))]),
+            );
+            PropMapping {
+                connectors: conns,
+                crtcs,
+                planes: HashMap::new(),
+            }
+        }
+
+        #[test]
+        fn a_full_commit_carries_the_connector_properties() {
+            let conn = from_u32::<connector::Handle>(10).unwrap();
+            let crtc = from_u32::<crtc::Handle>(20).unwrap();
+            let map = mapping(conn, crtc);
+            let props = [("Colorspace", 9), ("HDR_OUTPUT_METADATA", 77)];
+            let req = AtomicRequest::build_request(&map, crtc, None, false, [&conn], &props, [], []).unwrap();
+            let got = &req.connector_props[&conn];
+            assert!(matches!(got["Colorspace"], property::Value::Unknown(9)));
+            assert!(matches!(got["HDR_OUTPUT_METADATA"], property::Value::Unknown(77)));
+            assert!(req.build().is_ok());
+        }
+
+        #[test]
+        fn a_page_flip_carries_none() {
+            let conn = from_u32::<connector::Handle>(10).unwrap();
+            let crtc = from_u32::<crtc::Handle>(20).unwrap();
+            let map = mapping(conn, crtc);
+            let props = [("Colorspace", 9)];
+            let req = AtomicRequest::build_request(&map, crtc, None, false, [], &props, [], []).unwrap();
+            assert!(req.connector_props.is_empty());
+        }
+
+        #[test]
+        fn a_property_the_connector_lacks_is_refused() {
+            let conn = from_u32::<connector::Handle>(10).unwrap();
+            let crtc = from_u32::<crtc::Handle>(20).unwrap();
+            let map = mapping(conn, crtc);
+            let props = [("max bpc", 10)];
+            let res = AtomicRequest::build_request(&map, crtc, None, false, [&conn], &props, [], []);
+            assert!(matches!(res, Err(Error::UnknownProperty { name: "max bpc", .. })));
+        }
     }
 }

@@ -567,6 +567,14 @@ pub trait XwmHandler {
         let _ = (xwm, selection);
     }
 
+    /// The X client that owned a selection went away (its window was destroyed or its
+    /// connection closed), rather than clearing the selection itself.
+    ///
+    /// Defaults to [`XwmHandler::cleared_selection`].
+    fn selection_owner_gone(&mut self, xwm: XwmId, selection: SelectionTarget) {
+        self.cleared_selection(xwm, selection);
+    }
+
     /// The primary output of the randr protocol state was updated
     fn randr_primary_output_change(&mut self, xwm: XwmId, output_name: Option<String>) {
         let _ = (xwm, output_name);
@@ -1936,9 +1944,25 @@ where
 
             if n.owner == x11rb::NONE && selection.owner != *selection.window {
                 // A real X clients selection went away, not our proxy
+                selection.pending_transfers.lock().unwrap().clear();
+                let stuck: Vec<X11Window> = selection
+                    .incoming
+                    .iter()
+                    .filter(|(_, t)| t.incr && !t.incr_done)
+                    .map(|(w, _)| *w)
+                    .collect();
+                for w in stuck {
+                    if let Some(transfer) = selection.incoming.remove(&w) {
+                        transfer.destroy(loop_handle);
+                    }
+                }
+                let gone = n.subtype != x11rb::protocol::xfixes::SelectionEvent::SET_SELECTION_OWNER;
                 let selection = selection.type_().unwrap();
                 drop(_guard);
-                state.cleared_selection(xwm_id, selection);
+                match gone {
+                    true => state.selection_owner_gone(xwm_id, selection),
+                    false => state.cleared_selection(xwm_id, selection),
+                }
                 return Ok(());
             }
 

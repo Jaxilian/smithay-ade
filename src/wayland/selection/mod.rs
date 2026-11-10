@@ -36,6 +36,12 @@ pub trait SelectionHandler: Sized + SeatHandler {
     #[allow(unused_variables)]
     fn new_selection(&mut self, ty: SelectionTarget, source: Option<SelectionSource>, seat: Seat<Self>) {}
 
+    /// The client source of the current selection was destroyed, and the selection with it.
+    ///
+    /// The seat holds no selection when this is called.
+    #[allow(unused_variables)]
+    fn selection_source_destroyed(&mut self, ty: SelectionTarget, seat: Seat<Self>) {}
+
     /// A client requested to read the server-set selection.
     ///
     /// * `mime_type` - the requested mime type

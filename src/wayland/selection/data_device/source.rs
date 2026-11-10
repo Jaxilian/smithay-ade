@@ -21,6 +21,7 @@ use crate::input::{
 };
 use crate::utils::{IsAlive, alive_tracker::AliveTracker};
 use crate::wayland::Dispatch2;
+use crate::wayland::selection::SelectionTarget;
 use crate::wayland::selection::offer::OfferReplySource;
 use crate::wayland::selection::seat_data::SeatData;
 use crate::wayland::selection::source::SelectionSourceProvider;
@@ -93,19 +94,26 @@ where
             None => return,
         };
 
-        let mut seat_data = seat
-            .user_data()
-            .get::<RefCell<SeatData<D::SelectionUserData>>>()
-            .unwrap()
-            .borrow_mut();
+        let cleared = {
+            let mut seat_data = seat
+                .user_data()
+                .get::<RefCell<SeatData<D::SelectionUserData>>>()
+                .unwrap()
+                .borrow_mut();
 
-        match seat_data.get_clipboard_selection() {
-            Some(OfferReplySource::Client(SelectionSourceProvider::DataDevice(set_source)))
-                if set_source == source =>
-            {
-                seat_data.set_clipboard_selection::<D>(&self.display_handle, None)
+            match seat_data.get_clipboard_selection() {
+                Some(OfferReplySource::Client(SelectionSourceProvider::DataDevice(set_source)))
+                    if set_source == source =>
+                {
+                    seat_data.set_clipboard_selection::<D>(&self.display_handle, None);
+                    true
+                }
+                _ => false,
             }
-            _ => (),
+        };
+
+        if cleared {
+            state.selection_source_destroyed(SelectionTarget::Clipboard, seat);
         }
     }
 }

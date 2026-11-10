@@ -9,7 +9,9 @@ use crate::{
     input::Seat,
     wayland::{
         Dispatch2,
-        selection::{offer::OfferReplySource, seat_data::SeatData, source::SelectionSourceProvider},
+        selection::{
+            SelectionTarget, offer::OfferReplySource, seat_data::SeatData, source::SelectionSourceProvider,
+        },
     },
 };
 
@@ -77,19 +79,26 @@ where
             None => return,
         };
 
-        let mut seat_data = seat
-            .user_data()
-            .get::<RefCell<SeatData<D::SelectionUserData>>>()
-            .unwrap()
-            .borrow_mut();
+        let cleared = {
+            let mut seat_data = seat
+                .user_data()
+                .get::<RefCell<SeatData<D::SelectionUserData>>>()
+                .unwrap()
+                .borrow_mut();
 
-        match seat_data.get_primary_selection() {
-            Some(OfferReplySource::Client(SelectionSourceProvider::Primary(set_source)))
-                if set_source == source =>
-            {
-                seat_data.set_primary_selection::<D>(&self.display_handle, None)
+            match seat_data.get_primary_selection() {
+                Some(OfferReplySource::Client(SelectionSourceProvider::Primary(set_source)))
+                    if set_source == source =>
+                {
+                    seat_data.set_primary_selection::<D>(&self.display_handle, None);
+                    true
+                }
+                _ => false,
             }
-            _ => (),
+        };
+
+        if cleared {
+            state.selection_source_destroyed(SelectionTarget::Primary, seat);
         }
     }
 }

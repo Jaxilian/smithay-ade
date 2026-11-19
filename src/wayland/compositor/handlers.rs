@@ -1,6 +1,6 @@
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc, Mutex,
 };
 
 use wayland_server::{
@@ -65,7 +65,7 @@ where
     fn request(
         &self,
         state: &mut D,
-        _client: &wayland_server::Client,
+        client: &wayland_server::Client,
         _resource: &WlCompositor,
         request: wl_compositor::Request,
         _dhandle: &DisplayHandle,
@@ -96,6 +96,7 @@ where
                     id,
                     RegionUserData {
                         inner: Default::default(),
+                        held: state.client_compositor_state(client).clone_region_rects(),
                     },
                 );
             }
@@ -368,6 +369,7 @@ impl IsAlive for WlSurface {
 #[derive(Debug)]
 pub struct RegionUserData {
     pub(crate) inner: Mutex<RegionAttributes>,
+    pub(crate) held: Arc<AtomicUsize>,
 }
 
 impl<D> Dispatch2<WlRegion, D> for RegionUserData
@@ -388,7 +390,8 @@ where
         match request {
             wl_region::Request::Add { x, y, width, height } => {
                 if width > 0 && height > 0 {
-                    guard.push(
+                    guard.push_within(
+                        &self.held,
                         RectangleKind::Add,
                         Rectangle::<i32, Client>::new((x, y).into(), (width, height).into())
                             .to_f64()
@@ -399,7 +402,8 @@ where
             }
             wl_region::Request::Subtract { x, y, width, height } => {
                 if width > 0 && height > 0 {
-                    guard.push(
+                    guard.push_within(
+                        &self.held,
                         RectangleKind::Subtract,
                         Rectangle::<i32, Client>::new((x, y).into(), (width, height).into())
                             .to_f64()
@@ -413,6 +417,11 @@ where
             }
             _ => unreachable!(),
         }
+    }
+
+    fn destroyed(&self, _state: &mut D, _client_id: wayland_server::backend::ClientId, _region: &WlRegion) {
+        let kept = self.inner.lock().unwrap().charged();
+        self.held.fetch_sub(kept, Ordering::Relaxed);
     }
 }
 

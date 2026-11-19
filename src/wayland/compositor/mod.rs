@@ -112,7 +112,7 @@ mod tree;
 
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::{any::Any, sync::Mutex};
 
@@ -280,6 +280,7 @@ pub enum RectangleKind {
 }
 
 pub(crate) const REGION_RECT_CAP: usize = 4096;
+pub(crate) const CLIENT_RECT_BUDGET: usize = 65_536;
 
 /// Description of the contents of a region
 ///
@@ -309,9 +310,12 @@ impl RegionAttributes {
         }
 
         self.rects.push((kind, rect));
-        if self.rects.len() <= REGION_RECT_CAP {
-            return;
+        if self.rects.len() > REGION_RECT_CAP {
+            self.fold();
         }
+    }
+
+    fn fold(&mut self) {
         let mut all: Option<Rectangle<i32, Logical>> = None;
         for (kind, rect) in self.rects.iter() {
             if let RectangleKind::Add = kind {
@@ -322,6 +326,26 @@ impl RegionAttributes {
         self.rects.shrink_to_fit();
         self.rects.extend(all.map(|a| (RectangleKind::Add, a)));
         self.too_complex = true;
+    }
+
+    pub(crate) fn charged(&self) -> usize {
+        if self.too_complex { 0 } else { self.rects.len() }
+    }
+
+    pub(crate) fn push_within(
+        &mut self,
+        held: &AtomicUsize,
+        kind: RectangleKind,
+        rect: Rectangle<i32, Logical>,
+    ) {
+        let had = self.charged();
+        if !self.too_complex && held.load(Ordering::Relaxed) >= CLIENT_RECT_BUDGET {
+            self.fold();
+        }
+        self.push(kind, rect);
+
+        held.fetch_add(self.charged(), Ordering::Relaxed);
+        held.fetch_sub(had, Ordering::Relaxed);
     }
 }
 
@@ -656,6 +680,7 @@ pub struct CompositorClientState {
     queue: Mutex<Option<TransactionQueue>>,
     scale_override: Arc<AtomicF64>,
     last_touch_frame: Mutex<Option<FrameMarker>>,
+    region_rects: Arc<AtomicUsize>,
 }
 
 impl Default for CompositorClientState {
@@ -664,6 +689,7 @@ impl Default for CompositorClientState {
             queue: Mutex::new(None),
             scale_override: Arc::new(AtomicF64::new(1.)),
             last_touch_frame: Mutex::new(None),
+            region_rects: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -708,6 +734,10 @@ impl CompositorClientState {
 
     pub(crate) fn clone_client_scale(&self) -> Arc<AtomicF64> {
         self.scale_override.clone()
+    }
+
+    pub(crate) fn clone_region_rects(&self) -> Arc<AtomicUsize> {
+        self.region_rects.clone()
     }
 
     pub(crate) fn set_last_touch_frame(&self, frame_marker: FrameMarker) {
@@ -854,5 +884,47 @@ mod tests {
         assert!(!region.contains((0, 0)));
         assert!(region.contains((5, 5)));
         assert!(region.contains((2, 2)));
+    }
+
+    #[test]
+    fn regions_of_one_client_keep_no_more_than_its_budget_together() {
+        let held = AtomicUsize::new(0);
+        let mut regions = Vec::new();
+        for _ in 0..1000 {
+            let mut region = RegionAttributes::default();
+            for i in 0..REGION_RECT_CAP as i32 {
+                region.push_within(
+                    &held,
+                    RectangleKind::Add,
+                    Rectangle::new((i, 0).into(), (1, 1).into()),
+                );
+            }
+            regions.push(region);
+        }
+
+        let kept: usize = regions.iter().map(|r| r.charged()).sum();
+        assert_eq!(kept, held.load(Ordering::Relaxed));
+        assert_eq!(kept, CLIENT_RECT_BUDGET);
+        let whole = regions.iter().filter(|r| !r.too_complex).count();
+        assert_eq!(whole, CLIENT_RECT_BUDGET / REGION_RECT_CAP);
+        let last = regions.last().unwrap();
+        assert!(last.too_complex);
+        assert_eq!(
+            last.rects[0].1,
+            Rectangle::new((0, 0).into(), (REGION_RECT_CAP as i32, 1).into())
+        );
+
+        for region in regions.drain(..16) {
+            held.fetch_sub(region.charged(), Ordering::Relaxed);
+        }
+        assert_eq!(held.load(Ordering::Relaxed), 0);
+        let mut region = RegionAttributes::default();
+        region.push_within(
+            &held,
+            RectangleKind::Add,
+            Rectangle::new((0, 0).into(), (1, 1).into()),
+        );
+        assert!(!region.too_complex);
+        assert_eq!(held.load(Ordering::Relaxed), 1);
     }
 }

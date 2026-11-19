@@ -13,6 +13,8 @@ use std::{
     },
 };
 
+const ACCEPT_BATCH: usize = 16;
+
 /// Security context listener event source.
 ///
 /// This implements [`EventSource`] and may be inserted into an event loop.
@@ -46,7 +48,7 @@ impl EventSource for SecurityContextListenerSource {
         mut callback: F,
     ) -> io::Result<PostAction> {
         self.listen_fd.process_events(readiness, token, |_, socket| {
-            loop {
+            for _ in 0..ACCEPT_BATCH {
                 match socket.accept() {
                     Ok((stream, _)) => callback(stream, &mut ()),
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {

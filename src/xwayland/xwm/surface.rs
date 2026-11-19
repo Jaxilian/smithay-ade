@@ -2534,7 +2534,10 @@ fn fetch_opaque_regions(
                     .collect::<Vec<_>>()
             })
         })
-        .map(|rects| RegionAttributes { rects });
+        .map(|rects| RegionAttributes {
+            rects,
+            too_complex: false,
+        });
 
     Ok(opaque_region)
 }

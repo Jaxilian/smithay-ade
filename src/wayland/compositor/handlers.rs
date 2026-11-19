@@ -1,10 +1,9 @@
 use std::sync::{
-    Mutex,
     atomic::{AtomicBool, Ordering},
+    Mutex,
 };
 
 use wayland_server::{
-    DataInit, Dispatch, DisplayHandle, New, Resource, WEnum,
     protocol::{
         wl_callback::{self, WlCallback},
         wl_compositor::{self, WlCompositor},
@@ -13,20 +12,21 @@ use wayland_server::{
         wl_subsurface::{self, WlSubsurface},
         wl_surface::{self, WlSurface},
     },
+    DataInit, Dispatch, DisplayHandle, New, Resource, WEnum,
 };
 
 use crate::utils::{
-    Client, Logical, Point,
     alive_tracker::{AliveTracker, IsAlive},
+    Client, Logical, Point,
 };
 
 use crate::wayland::{Dispatch2, GlobalData, GlobalDispatch2};
 
 use super::{
-    AlreadyHasRole, BufferAssignment, CompositorHandler, Damage, Rectangle, RectangleKind, RegionAttributes,
-    SurfaceAttributes,
     cache::Cacheable,
     tree::{Location, PrivateSurfaceData},
+    AlreadyHasRole, BufferAssignment, CompositorHandler, Damage, Rectangle, RectangleKind, RegionAttributes,
+    SurfaceAttributes,
 };
 
 use tracing::trace;
@@ -388,28 +388,27 @@ where
     ) {
         let mut guard = self.inner.lock().unwrap();
         let client_scale = state.client_compositor_state(client).client_scale();
-
         match request {
             wl_region::Request::Add { x, y, width, height } => {
                 if width > 0 && height > 0 {
-                    guard.rects.push((
+                    guard.push(
                         RectangleKind::Add,
                         Rectangle::<i32, Client>::new((x, y).into(), (width, height).into())
                             .to_f64()
                             .to_logical(client_scale)
                             .to_i32_round(),
-                    ));
+                    );
                 }
             }
             wl_region::Request::Subtract { x, y, width, height } => {
                 if width > 0 && height > 0 {
-                    guard.rects.push((
+                    guard.push(
                         RectangleKind::Subtract,
                         Rectangle::<i32, Client>::new((x, y).into(), (width, height).into())
                             .to_f64()
                             .to_logical(client_scale)
                             .to_i32_round(),
-                    ));
+                    );
                 }
             }
             wl_region::Request::Destroy => {

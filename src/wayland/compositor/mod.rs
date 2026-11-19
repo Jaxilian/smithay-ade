@@ -111,8 +111,8 @@ mod transaction;
 mod tree;
 
 use std::cell::RefCell;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::{any::Any, sync::Mutex};
 
 pub use self::cache::{Cacheable, CachedState, MultiCache};
@@ -122,9 +122,9 @@ pub use self::transaction::{Barrier, Blocker, BlockerState};
 pub use self::tree::{AlreadyHasRole, TraversalAction};
 use self::tree::{PrivateSurfaceData, SuggestedSurfaceState};
 use crate::input::touch::FrameMarker;
-use crate::utils::Transform;
 pub use crate::utils::hook::HookId;
-use crate::utils::{Buffer, Logical, Point, Rectangle, user_data::UserDataMap};
+use crate::utils::Transform;
+use crate::utils::{user_data::UserDataMap, Buffer, Logical, Point, Rectangle};
 use crate::wayland::GlobalData;
 use portable_atomic::AtomicF64;
 use wayland_server::backend::GlobalId;
@@ -278,6 +278,8 @@ pub enum RectangleKind {
     Subtract,
 }
 
+pub(crate) const REGION_RECT_CAP: usize = 4096;
+
 /// Description of the contents of a region
 ///
 /// A region is defined as an union and difference of rectangle.
@@ -289,6 +291,37 @@ pub enum RectangleKind {
 pub struct RegionAttributes {
     /// List of rectangle part of this region
     pub rects: Vec<(RectangleKind, Rectangle<i32, Logical>)>,
+    /// The client sent more rectangles than a region keeps: `rects` holds
+    /// only the bounding box of the added ones, and grows with later adds.
+    pub too_complex: bool,
+}
+
+impl RegionAttributes {
+    pub(crate) fn push(&mut self, kind: RectangleKind, rect: Rectangle<i32, Logical>) {
+        if self.too_complex {
+            match (kind, self.rects.first_mut()) {
+                (RectangleKind::Add, Some((_, all))) => *all = all.merge(rect),
+                (RectangleKind::Add, None) => self.rects.push((kind, rect)),
+                (RectangleKind::Subtract, _) => {}
+            }
+            return;
+        }
+
+        self.rects.push((kind, rect));
+        if self.rects.len() <= REGION_RECT_CAP {
+            return;
+        }
+        let mut all: Option<Rectangle<i32, Logical>> = None;
+        for (kind, rect) in self.rects.iter() {
+            if let RectangleKind::Add = kind {
+                all = Some(all.map_or(*rect, |a| a.merge(*rect)));
+            }
+        }
+        self.rects.clear();
+        self.rects.shrink_to_fit();
+        self.rects.extend(all.map(|a| (RectangleKind::Add, a)));
+        self.too_complex = true;
+    }
 }
 
 impl RegionAttributes {
@@ -744,8 +777,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn region_past_the_cap_keeps_only_the_box_of_its_adds() {
+        let mut region = RegionAttributes::default();
+        for i in 0..REGION_RECT_CAP as i32 {
+            region.push(RectangleKind::Add, Rectangle::new((i, 0).into(), (1, 1).into()));
+        }
+        assert!(!region.too_complex);
+        assert_eq!(region.rects.len(), REGION_RECT_CAP);
+
+        region.push(
+            RectangleKind::Subtract,
+            Rectangle::new((0, 0).into(), (2, 1).into()),
+        );
+        assert!(region.too_complex);
+        for i in 0..1_000_000 {
+            region.push(
+                RectangleKind::Add,
+                Rectangle::new((i % 9000, 0).into(), (1, 2).into()),
+            );
+            region.push(
+                RectangleKind::Subtract,
+                Rectangle::new((0, 0).into(), (5, 5).into()),
+            );
+        }
+
+        assert_eq!(region.rects.len(), 1);
+        assert!(region.rects.capacity() <= 4);
+        let (_, all) = region.rects[0];
+        assert_eq!(all, Rectangle::new((0, 0).into(), (9000, 2).into()));
+        assert!(region.contains((8999, 1)));
+        assert!(!region.contains((9000, 1)));
+    }
+
+    #[test]
     fn region_attributes_empty() {
-        let region = RegionAttributes { rects: vec![] };
+        let region = RegionAttributes::default();
         assert!(!region.contains((0, 0)));
     }
 
@@ -753,6 +819,7 @@ mod tests {
     fn region_attributes_add() {
         let region = RegionAttributes {
             rects: vec![(RectangleKind::Add, Rectangle::from_size((10, 10).into()))],
+            ..Default::default()
         };
 
         assert!(region.contains((0, 0)));
@@ -765,6 +832,7 @@ mod tests {
                 (RectangleKind::Add, Rectangle::from_size((10, 10).into())),
                 (RectangleKind::Subtract, Rectangle::from_size((5, 5).into())),
             ],
+            ..Default::default()
         };
 
         assert!(!region.contains((0, 0)));
@@ -779,6 +847,7 @@ mod tests {
                 (RectangleKind::Subtract, Rectangle::from_size((5, 5).into())),
                 (RectangleKind::Add, Rectangle::new((2, 2).into(), (2, 2).into())),
             ],
+            ..Default::default()
         };
 
         assert!(!region.contains((0, 0)));

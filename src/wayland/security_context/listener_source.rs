@@ -47,6 +47,13 @@ impl EventSource for SecurityContextListenerSource {
         token: Token,
         mut callback: F,
     ) -> io::Result<PostAction> {
+        let closed = self
+            .close_fd
+            .process_events(readiness, token, |_, _fd| Ok(PostAction::Remove))?;
+        if let PostAction::Remove = closed {
+            return Ok(PostAction::Remove);
+        }
+
         self.listen_fd.process_events(readiness, token, |_, socket| {
             for _ in 0..ACCEPT_BATCH {
                 match socket.accept() {
@@ -60,10 +67,7 @@ impl EventSource for SecurityContextListenerSource {
                 }
             }
             Ok(PostAction::Continue)
-        })?;
-
-        self.close_fd
-            .process_events(readiness, token, |_, _fd| Ok(PostAction::Remove))
+        })
     }
 
     fn register(&mut self, poll: &mut Poll, token_factory: &mut TokenFactory) -> calloop::Result<()> {

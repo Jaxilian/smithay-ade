@@ -84,7 +84,7 @@ where
                     },
                 );
 
-                state.compositor_state().surfaces.push(surface.clone());
+                state.compositor_state().surfaces.insert(surface.clone());
 
                 PrivateSurfaceData::init(&surface);
                 state.new_surface(&surface);
@@ -347,10 +347,7 @@ where
         state.destroyed(surface);
 
         // Remove the surface after the callback is invoked.
-        state
-            .compositor_state()
-            .surfaces
-            .retain(|s| s.id() != surface.id());
+        state.compositor_state().surfaces.remove(surface);
         PrivateSurfaceData::cleanup(state, self, surface);
     }
 }

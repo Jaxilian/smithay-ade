@@ -227,6 +227,15 @@ pub(crate) struct Transaction {
     blockers: Vec<Box<dyn Blocker + Send>>,
 }
 
+impl Transaction {
+    /// The live surfaces of this transaction, each with the id of its state
+    pub(crate) fn surfaces(&self) -> impl Iterator<Item = (WlSurface, Serial)> + '_ {
+        self.surfaces
+            .iter()
+            .filter_map(|(surface, id)| Some((surface.upgrade().ok()?, *id)))
+    }
+}
+
 impl fmt::Debug for Box<dyn Blocker + Send> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Blocker").field("state", &self.state()).finish()

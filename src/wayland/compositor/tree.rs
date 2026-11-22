@@ -268,7 +268,10 @@ impl PrivateSurfaceData {
         }
 
         let current_txid = my_data.current_txid;
-        my_data.public_data.cached_state.commit(Some(current_txid), dh);
+        my_data
+            .public_data
+            .cached_state
+            .commit(Some(current_txid), true, dh);
         my_data
             .pending_transaction
             .insert_state(surface.clone(), current_txid);
@@ -284,7 +287,10 @@ impl PrivateSurfaceData {
         let mut my_data = Self::lock_user_data(surface);
         // commit our state
         let current_txid = my_data.current_txid;
-        my_data.public_data.cached_state.commit(Some(current_txid), dh);
+        my_data
+            .public_data
+            .cached_state
+            .commit(Some(current_txid), !is_sync, dh);
         // take all our children state into our pending transaction
         for child in children {
             // if the child is effectively sync, take its state
@@ -317,10 +323,18 @@ impl PrivateSurfaceData {
                 None => return,
             };
             // if we are not sync, add the transaction to the queue
-            let tx = std::mem::take(&mut my_data.pending_transaction);
+            let tx = std::mem::take(&mut my_data.pending_transaction).finalize();
+            // the states this transaction names must keep their ids until it is applied
+            for (named, id) in tx.surfaces() {
+                if named == *surface {
+                    my_data.public_data.cached_state.name(id);
+                } else {
+                    Self::lock_user_data(&named).public_data.cached_state.name(id);
+                }
+            }
             let mut queue_guard = state.client_compositor_state(&client).queue.lock().unwrap();
             let queue = queue_guard.get_or_insert_with(TransactionQueue::default);
-            queue.append(tx.finalize());
+            queue.append(tx);
             // release the mutex, as applying the transaction will try to lock it
             std::mem::drop(my_data);
             // trigger the queue

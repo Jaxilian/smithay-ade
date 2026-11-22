@@ -967,7 +967,7 @@ impl X11Surface {
                     compositor::with_states(wl_surface, |states| {
                         let mut guard = states.cached_state.get::<SurfaceAttributes>();
                         let attrs = guard.pending();
-                        attrs.opaque_region = opaque_region;
+                        attrs.opaque_region = opaque_region.map(Arc::new);
                     });
                 }
             })
@@ -2544,7 +2544,7 @@ fn fetch_opaque_regions(
         })
         .map(|rects| RegionAttributes {
             rects,
-            too_complex: false,
+            ..Default::default()
         });
 
     Ok(opaque_region)

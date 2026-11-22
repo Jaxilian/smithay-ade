@@ -368,7 +368,7 @@ impl IsAlive for WlSurface {
 /// User data of WlRegion
 #[derive(Debug)]
 pub struct RegionUserData {
-    pub(crate) inner: Mutex<RegionAttributes>,
+    pub(crate) inner: Mutex<Arc<RegionAttributes>>,
     pub(crate) held: Arc<AtomicUsize>,
 }
 
@@ -390,7 +390,7 @@ where
         match request {
             wl_region::Request::Add { x, y, width, height } => {
                 if width > 0 && height > 0 {
-                    guard.push_within(
+                    Arc::make_mut(&mut guard).push_within(
                         &self.held,
                         RectangleKind::Add,
                         Rectangle::<i32, Client>::new((x, y).into(), (width, height).into())
@@ -402,7 +402,7 @@ where
             }
             wl_region::Request::Subtract { x, y, width, height } => {
                 if width > 0 && height > 0 {
-                    guard.push_within(
+                    Arc::make_mut(&mut guard).push_within(
                         &self.held,
                         RectangleKind::Subtract,
                         Rectangle::<i32, Client>::new((x, y).into(), (width, height).into())
@@ -420,8 +420,7 @@ where
     }
 
     fn destroyed(&self, _state: &mut D, _client_id: wayland_server::backend::ClientId, _region: &WlRegion) {
-        let kept = self.inner.lock().unwrap().charged();
-        self.held.fetch_sub(kept, Ordering::Relaxed);
+        *self.inner.lock().unwrap() = Arc::default();
     }
 }
 

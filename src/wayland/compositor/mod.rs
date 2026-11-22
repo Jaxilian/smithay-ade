@@ -223,11 +223,11 @@ pub struct SurfaceAttributes {
     /// Region of the surface that is guaranteed to be opaque
     ///
     /// By default the whole surface is potentially transparent
-    pub opaque_region: Option<RegionAttributes>,
+    pub opaque_region: Option<Arc<RegionAttributes>>,
     /// Region of the surface that is sensitive to user input
     ///
     /// By default the whole surface should be sensitive
-    pub input_region: Option<RegionAttributes>,
+    pub input_region: Option<Arc<RegionAttributes>>,
     /// Damage rectangle
     ///
     /// Hint provided by the client to suggest that only this part
@@ -296,6 +296,27 @@ pub struct RegionAttributes {
     /// The client sent more rectangles than a region keeps: `rects` holds
     /// only the bounding box of the added ones, and grows with later adds.
     pub too_complex: bool,
+    pub(crate) charge: Charge,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct Charge {
+    held: Option<Arc<AtomicUsize>>,
+    count: usize,
+}
+
+impl Clone for Charge {
+    fn clone(&self) -> Self {
+        Charge::default()
+    }
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        if let Some(held) = &self.held {
+            held.fetch_sub(self.count, Ordering::Relaxed);
+        }
+    }
 }
 
 impl RegionAttributes {
@@ -334,18 +355,23 @@ impl RegionAttributes {
 
     pub(crate) fn push_within(
         &mut self,
-        held: &AtomicUsize,
+        held: &Arc<AtomicUsize>,
         kind: RectangleKind,
         rect: Rectangle<i32, Logical>,
     ) {
-        let had = self.charged();
-        if !self.too_complex && held.load(Ordering::Relaxed) >= CLIENT_RECT_BUDGET {
+        let others = held.load(Ordering::Relaxed).saturating_sub(self.charge.count);
+        if !self.too_complex && others + self.rects.len() >= CLIENT_RECT_BUDGET {
             self.fold();
         }
         self.push(kind, rect);
 
-        held.fetch_add(self.charged(), Ordering::Relaxed);
-        held.fetch_sub(had, Ordering::Relaxed);
+        let now = self.charged();
+        held.fetch_add(now, Ordering::Relaxed);
+        held.fetch_sub(self.charge.count, Ordering::Relaxed);
+        self.charge.count = now;
+        if self.charge.held.is_none() {
+            self.charge.held = Some(held.clone());
+        }
     }
 }
 
@@ -495,7 +521,7 @@ pub fn send_surface_state(surface: &WlSurface, data: &SurfaceData, scale: i32, t
 /// will panic (having more than one compositor is not supported).
 pub fn get_region_attributes(region: &wl_region::WlRegion) -> RegionAttributes {
     match region.data::<RegionUserData>() {
-        Some(data) => data.inner.lock().unwrap().clone(),
+        Some(data) => RegionAttributes::clone(&data.inner.lock().unwrap()),
         None => panic!("Accessing the data of foreign regions is not supported."),
     }
 }
@@ -888,7 +914,7 @@ mod tests {
 
     #[test]
     fn regions_of_one_client_keep_no_more_than_its_budget_together() {
-        let held = AtomicUsize::new(0);
+        let held = Arc::new(AtomicUsize::new(0));
         let mut regions = Vec::new();
         for _ in 0..1000 {
             let mut region = RegionAttributes::default();
@@ -914,9 +940,7 @@ mod tests {
             Rectangle::new((0, 0).into(), (REGION_RECT_CAP as i32, 1).into())
         );
 
-        for region in regions.drain(..16) {
-            held.fetch_sub(region.charged(), Ordering::Relaxed);
-        }
+        regions.drain(..16);
         assert_eq!(held.load(Ordering::Relaxed), 0);
         let mut region = RegionAttributes::default();
         region.push_within(
@@ -926,5 +950,42 @@ mod tests {
         );
         assert!(!region.too_complex);
         assert_eq!(held.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_region_set_on_surfaces_is_one_list_and_each_changed_copy_is_charged() {
+        let held = Arc::new(AtomicUsize::new(0));
+        let add = |region: &mut Arc<RegionAttributes>, i: i32| {
+            Arc::make_mut(region).push_within(
+                &held,
+                RectangleKind::Add,
+                Rectangle::new((i, 0).into(), (1, 1).into()),
+            );
+        };
+        let mut region = Arc::new(RegionAttributes::default());
+        for i in 0..REGION_RECT_CAP as i32 - 100 {
+            add(&mut region, i);
+        }
+        let many: Vec<_> = (0..1000).map(|_| region.clone()).collect();
+        assert_eq!(held.load(Ordering::Relaxed), REGION_RECT_CAP - 100);
+        assert!(many.iter().all(|r| Arc::ptr_eq(r, &region)));
+        drop(many);
+
+        let mut set = Vec::new();
+        for i in 0..100 {
+            set.push(region.clone());
+            add(&mut region, REGION_RECT_CAP as i32 + i);
+            assert!(held.load(Ordering::Relaxed) <= CLIENT_RECT_BUDGET);
+        }
+        assert!(region.too_complex);
+        let whole = set.iter().filter(|r| !r.too_complex).count();
+        assert_eq!(whole, CLIENT_RECT_BUDGET / REGION_RECT_CAP);
+        let kept: usize = set.iter().map(|r| r.charged()).sum();
+        assert_eq!(kept, held.load(Ordering::Relaxed));
+
+        drop(region);
+        assert_eq!(kept, held.load(Ordering::Relaxed));
+        drop(set);
+        assert_eq!(held.load(Ordering::Relaxed), 0);
     }
 }

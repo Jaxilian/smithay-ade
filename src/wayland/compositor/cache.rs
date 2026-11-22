@@ -62,6 +62,12 @@ pub trait Cacheable: Default {
     fn merge_into(self, into: &mut Self, dh: &DisplayHandle);
 }
 
+/// The commits of one surface that wait at once, each with its own state: those
+/// of a synchronized subsurface until its parent commits, and those behind a
+/// blocker. A commit past this many joins the newest waiting one and takes
+/// effect with it, so the states kept do not grow with the commits sent.
+const CACHE_MAX: usize = 64;
+
 /// Double buffered cached state of type `T`
 #[derive(Debug)]
 pub struct CachedState<T> {
@@ -105,8 +111,13 @@ impl<T: Cacheable + 'static> Cache for Mutex<CachedState<T>> {
         let me = &mut *guard;
         let new_state = me.pending.commit(dh);
         if let Some(id) = commit_id {
+            let full = me.cache.len() >= CACHE_MAX;
             match me.cache.back_mut() {
                 Some(&mut (cid, ref mut state)) if cid == id => new_state.merge_into(state, dh),
+                Some(&mut (ref mut cid, ref mut state)) if full => {
+                    *cid = id;
+                    new_state.merge_into(state, dh);
+                }
                 _ => me.cache.push_back((id, new_state)),
             }
         } else {

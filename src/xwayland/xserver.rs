@@ -479,6 +479,17 @@ impl ClientData for XWaylandClientData {
 }
 
 impl XWaylandClientData {
+    /// Client data for an `Xwayland` a compositor spawned itself, in place of
+    /// [`XWayland::spawn`]. `child` is waited for when the client disconnects.
+    pub fn new(child: Child) -> Self {
+        Self {
+            #[cfg(feature = "wayland_frontend")]
+            compositor_state: CompositorClientState::default(),
+            data_map: UserDataMap::new(),
+            child: Mutex::new(Some(child)),
+        }
+    }
+
     /// Access user_data map for a xwayland client
     pub fn user_data(&self) -> &UserDataMap {
         &self.data_map

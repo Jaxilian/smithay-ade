@@ -2043,6 +2043,14 @@ impl X11Surface {
         Ok(0)
     }
 
+    /// Returns whether a drag started by an X11 client is ongoing.
+    ///
+    /// While one is, [`X11Surface::surface_under`] finds nothing on an unmanaged
+    /// window; a compositor with a hit test of its own asks here to do the same.
+    pub fn xdnd_active(&self) -> bool {
+        self.xdnd_active.load(Ordering::Acquire)
+    }
+
     /// Returns the topmost (sub-)surface under a given position of the surface.
     ///
     /// In case the window is not mapped or is unmanaged while an XDND operation is ongoing [`None`] is returned.

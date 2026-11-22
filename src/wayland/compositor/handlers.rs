@@ -109,6 +109,23 @@ where
  * wl_surface
  */
 
+/// The damage rectangles one state of a surface keeps. A client may send
+/// any number before a commit, and a synchronized subsurface may commit any
+/// number before its parent does; past this many the list is one rectangle
+/// that covers any buffer.
+const DAMAGE_MAX: usize = 64;
+
+fn push_damage(list: &mut Vec<Damage>, damage: Damage) {
+    if list.len() < DAMAGE_MAX {
+        list.push(damage);
+        return;
+    }
+    let whole = Rectangle::new((0, 0).into(), (i32::MAX, i32::MAX).into());
+    list.clear();
+    list.shrink_to(DAMAGE_MAX);
+    list.push(Damage::Buffer(whole));
+}
+
 impl Cacheable for SurfaceAttributes {
     fn commit(&mut self, _dh: &DisplayHandle) -> Self {
         SurfaceAttributes {
@@ -141,7 +158,9 @@ impl Cacheable for SurfaceAttributes {
         into.buffer_delta = self.buffer_delta;
         into.buffer_scale = self.buffer_scale;
         into.buffer_transform = self.buffer_transform;
-        into.damage.extend(self.damage);
+        for damage in self.damage {
+            push_damage(&mut into.damage, damage);
+        }
         into.opaque_region = self.opaque_region;
         into.input_region = self.input_region;
         into.frame_callbacks.extend(self.frame_callbacks);
@@ -213,17 +232,16 @@ where
             wl_surface::Request::Damage { x, y, width, height } => {
                 let client_scale = state.client_compositor_state(client).client_scale();
                 PrivateSurfaceData::with_states(surface, |states| {
-                    states
-                        .cached_state
-                        .get::<SurfaceAttributes>()
-                        .pending()
-                        .damage
-                        .push(Damage::Surface(
+                    let mut guard = states.cached_state.get::<SurfaceAttributes>();
+                    push_damage(
+                        &mut guard.pending().damage,
+                        Damage::Surface(
                             Rectangle::<i32, Client>::new((x, y).into(), (width, height).into())
                                 .to_f64()
                                 .to_logical(client_scale)
                                 .to_i32_round(),
-                        ));
+                        ),
+                    );
                 });
             }
             wl_surface::Request::Frame { callback } => {
@@ -308,15 +326,11 @@ where
                 }
 
                 PrivateSurfaceData::with_states(surface, |states| {
-                    states
-                        .cached_state
-                        .get::<SurfaceAttributes>()
-                        .pending()
-                        .damage
-                        .push(Damage::Buffer(Rectangle::new(
-                            (x, y).into(),
-                            (width, height).into(),
-                        )))
+                    let mut guard = states.cached_state.get::<SurfaceAttributes>();
+                    push_damage(
+                        &mut guard.pending().damage,
+                        Damage::Buffer(Rectangle::new((x, y).into(), (width, height).into())),
+                    );
                 });
             }
             wl_surface::Request::Offset { x, y } => {

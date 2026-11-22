@@ -66,7 +66,30 @@ pub trait Cacheable: Default {
 /// of a synchronized subsurface until its parent commits, and those behind a
 /// blocker. A commit past this many joins the newest waiting one and takes
 /// effect with it, so the states kept do not grow with the commits sent.
-const CACHE_MAX: usize = 64;
+///
+/// A commit that is not yet part of a queued transaction (a synchronized
+/// subsurface's) does not join a state that a queued transaction names: that
+/// transaction would find nothing under the id it holds. It is pushed instead,
+/// once for each queued transaction, and later commits join it.
+const CACHE_MAX: usize = 8;
+
+/// The same for commits queued with their own transaction, which wait behind
+/// blockers only. The compositor bounds those itself: ade lets a fifo barrier
+/// go at 32 held commits a surface, each shown for a frame, and a queue of
+/// fewer than 33 would show some of them as one.
+const CACHE_QUEUED_MAX: usize = 33;
+
+/// The room a queue of waiting states keeps once it is empty.
+const CACHE_KEEP: usize = 4;
+
+/// What a commit may do with the newest waiting state when the queue is full.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Join {
+    /// The commit's own transaction is queued with it
+    pub(crate) queued: bool,
+    /// The newest id of this surface that a queued transaction names
+    pub(crate) named: Option<Serial>,
+}
 
 /// Double buffered cached state of type `T`
 #[derive(Debug)]
@@ -99,22 +122,27 @@ impl<T> CachedState<T> {
 }
 
 trait Cache: Downcast {
-    fn commit(&self, commit_id: Option<Serial>, dh: &DisplayHandle);
+    fn commit(&self, commit_id: Option<Serial>, join: Join, dh: &DisplayHandle);
     fn apply_state(&self, commit_id: Serial, dh: &DisplayHandle);
 }
 
 impl_downcast!(Cache);
 
 impl<T: Cacheable + 'static> Cache for Mutex<CachedState<T>> {
-    fn commit(&self, commit_id: Option<Serial>, dh: &DisplayHandle) {
+    fn commit(&self, commit_id: Option<Serial>, join: Join, dh: &DisplayHandle) {
         let mut guard = self.lock().unwrap();
         let me = &mut *guard;
         let new_state = me.pending.commit(dh);
         if let Some(id) = commit_id {
-            let full = me.cache.len() >= CACHE_MAX;
+            let most = match join.queued {
+                true => CACHE_QUEUED_MAX,
+                false => CACHE_MAX,
+            };
+            let full = me.cache.len() >= most;
+            let free = |cid: Serial| join.queued || join.named.is_none_or(|named| cid > named);
             match me.cache.back_mut() {
                 Some(&mut (cid, ref mut state)) if cid == id => new_state.merge_into(state, dh),
-                Some(&mut (ref mut cid, ref mut state)) if full => {
+                Some(&mut (ref mut cid, ref mut state)) if full && free(*cid) => {
                     *cid = id;
                     new_state.merge_into(state, dh);
                 }
@@ -125,6 +153,7 @@ impl<T: Cacheable + 'static> Cache for Mutex<CachedState<T>> {
                 state.merge_into(&mut me.current, dh);
             }
             new_state.merge_into(&mut me.current, dh);
+            me.cache.shrink_to(CACHE_KEEP);
         }
     }
 
@@ -136,6 +165,9 @@ impl<T: Cacheable + 'static> Cache for Mutex<CachedState<T>> {
                 break;
             }
             me.cache.pop_front().unwrap().1.merge_into(&mut me.current, dh);
+        }
+        if me.cache.is_empty() && me.cache.capacity() > CACHE_KEEP {
+            me.cache.shrink_to(CACHE_KEEP);
         }
     }
 }
@@ -162,6 +194,7 @@ impl<T: Cacheable + 'static> Cache for Mutex<CachedState<T>> {
 /// The stored values are initialized lazily the first time [`get`][Self::get] is invoked with this type as argument.
 pub struct MultiCache {
     caches: appendlist::AppendList<Box<dyn Cache + Send>>,
+    named: Option<Serial>,
 }
 
 impl std::fmt::Debug for MultiCache {
@@ -174,6 +207,7 @@ impl MultiCache {
     pub(crate) fn new() -> Self {
         Self {
             caches: appendlist::AppendList::new(),
+            named: None,
         }
     }
 
@@ -214,11 +248,25 @@ impl MultiCache {
     ///
     /// If a None commit is given but there are some cached states, they'll
     /// all be merged into the current state before merging the pending one.
-    pub(crate) fn commit(&mut self, commit_id: Option<Serial>, dh: &DisplayHandle) {
+    ///
+    /// `queued` says that the transaction of this commit is queued with it; a
+    /// commit whose transaction still waits for a parent's is not.
+    pub(crate) fn commit(&mut self, commit_id: Option<Serial>, queued: bool, dh: &DisplayHandle) {
+        let join = Join {
+            queued,
+            named: self.named,
+        };
         // none of the underlying borrow_mut() can panic, as we hold
         // a &mut reference to the container, non are borrowed.
         for cache in &self.caches {
-            cache.commit(commit_id, dh);
+            cache.commit(commit_id, join, dh);
+        }
+    }
+
+    /// A queued transaction names the state of this id
+    pub(crate) fn name(&mut self, id: Serial) {
+        if self.named.is_none_or(|named| id > named) {
+            self.named = Some(id);
         }
     }
 

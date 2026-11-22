@@ -112,8 +112,8 @@ where
 /// The damage rectangles one state of a surface keeps. A client may send
 /// any number before a commit, and a synchronized subsurface may commit any
 /// number before its parent does; past this many the list is one rectangle
-/// that covers any buffer.
-const DAMAGE_MAX: usize = 64;
+/// that covers any buffer. ade's latch keeps 16 of each form at most.
+const DAMAGE_MAX: usize = 16;
 
 fn push_damage(list: &mut Vec<Damage>, damage: Damage) {
     if list.len() < DAMAGE_MAX {

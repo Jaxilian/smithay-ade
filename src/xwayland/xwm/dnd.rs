@@ -446,7 +446,7 @@ impl XWmDnd {
                         self.selection.atoms.XdndTypeList,
                         AtomEnum::ANY,
                         0,
-                        0x1fffffff,
+                        super::ATOMS_MAX,
                     )?
                     .reply()?;
                 let Some(values) = reply.value32() else {

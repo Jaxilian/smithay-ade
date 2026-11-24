@@ -698,6 +698,20 @@ pub enum ResizeEdge {
     BottomRight,
 }
 
+pub(crate) const WINDOWS_MAX: usize = 2048;
+pub(crate) const WINDOWS_CLIENT_MAX: usize = 512;
+pub(crate) const TRANSFERS_MAX: usize = 8;
+pub(crate) const TRANSFER_WORDS_MAX: u32 = 1 << 22;
+pub(crate) const TRANSFER_HELD_MAX: usize = 4 * selection::INCR_CHUNK_SIZE;
+pub(crate) const TARGETS_MAX: usize = 256;
+pub(crate) const ATOMS_MAX: u32 = 64;
+pub(crate) const TEXT_WORDS_MAX: u32 = 1024;
+pub(crate) const OPAQUE_WORDS_MAX: u32 = 1024;
+pub(crate) const MIME_NAMES_MAX: usize = 1024;
+pub(crate) const MIME_BYTES_MAX: usize = 256;
+
+static MIME_NAMES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 /// Errors generated working with Xwm Selections
 #[derive(thiserror::Error, Debug)]
 pub enum SelectionError {
@@ -710,6 +724,9 @@ pub enum SelectionError {
     /// Unable to determine internal Atom for given mime-type
     #[error("Unable to determine ATOM matching mime-type")]
     UnableToDetermineAtom,
+    /// As many transfers from the X11 owner wait as are kept at once
+    #[error("Too many transfers from the X11 owner wait")]
+    TooManyTransfers,
 }
 
 impl From<ConnectionError> for SelectionError {
@@ -1078,6 +1095,21 @@ impl X11Wm {
         self.id
     }
 
+    /// What is held for X11 clients: windows, serials without a surface, transfers from X11, transfers to X11
+    pub fn held(&self) -> [usize; 4] {
+        let sels = [&self.clipboard, &self.primary, &self.dnd.selection];
+        let from = sels
+            .iter()
+            .map(|s| s.incoming.len() + s.pending_transfers.lock().unwrap().len());
+        let to = sels.iter().map(|s| s.outgoing.len());
+        [
+            self.windows.len(),
+            self.unpaired_surfaces.len(),
+            from.sum(),
+            to.sum(),
+        ]
+    }
+
     /// Whether or not the XSYNC extension is present
     ///
     /// This can be used to tell if the `_NET_WM_SYNC_REQUEST` protocol can be used.
@@ -1344,6 +1376,11 @@ impl X11Wm {
 
         debug!("Mime-type {:?} / Atom {:?}", mime_type, atom);
 
+        let waiting = selection.pending_transfers.lock().unwrap().len();
+        if waiting + selection.incoming.len() >= TRANSFERS_MAX {
+            return Err(SelectionError::TooManyTransfers);
+        }
+
         if let Err(err) = rustix::fs::fcntl_setfl(&fd, OFlags::WRONLY | OFlags::NONBLOCK) {
             warn!(?err, "Failed to restrict wl file descriptor");
         }
@@ -1581,6 +1618,17 @@ where
                 return Ok(());
             }
 
+            let mask = conn.setup().resource_id_mask;
+            let mine = xwm
+                .windows
+                .iter()
+                .filter(|s| s.window_id() & !mask == n.window & !mask)
+                .count();
+            if xwm.windows.len() >= WINDOWS_MAX || mine >= WINDOWS_CLIENT_MAX {
+                warn!(window = n.window, "Too many X11 windows, this one is not managed");
+                return Ok(());
+            }
+
             let attrs = conn.get_window_attributes(n.window)?.reply()?;
             if attrs.class != WindowClass::INPUT_OUTPUT {
                 return Ok(());
@@ -1693,7 +1741,7 @@ where
                     // Per EWMH spec, clients may set _NET_WM_STATE prior to mapping
                     // and the window manager must respect it.
                     if let Ok(reply) = conn
-                        .get_property(false, win, xwm.atoms._NET_WM_STATE, AtomEnum::ATOM, 0, 1024)?
+                        .get_property(false, win, xwm.atoms._NET_WM_STATE, AtomEnum::ATOM, 0, ATOMS_MAX)?
                         .reply()
                     {
                         if let Some(states) = reply.value32() {
@@ -1916,6 +1964,7 @@ where
             xwm.clipboard.window_destroyed(&n.window, loop_handle);
             xwm.primary.window_destroyed(&n.window, loop_handle);
             xwm.dnd.window_destroyed(&n.window, loop_handle);
+            xwm.unpaired_surfaces.retain(|_, w| *w != n.window);
 
             if let Some(pos) = xwm.windows.iter().position(|x| x.window_id() == n.window) {
                 let surface = xwm.windows.remove(pos);
@@ -1936,6 +1985,19 @@ where
                 _ => return Ok(()),
             };
 
+            selection.pending_transfers.lock().unwrap().clear();
+            let stuck: Vec<X11Window> = selection
+                .incoming
+                .iter()
+                .filter(|(_, t)| !t.incr_done && (t.incr || t.source_data.is_empty()))
+                .map(|(w, _)| *w)
+                .collect();
+            for w in stuck {
+                if let Some(transfer) = selection.incoming.remove(&w) {
+                    transfer.destroy(loop_handle);
+                }
+            }
+
             selection.owner = n.owner;
             if selection.owner == *selection.window {
                 selection.timestamp = n.timestamp;
@@ -1943,19 +2005,6 @@ where
             }
 
             if n.owner == x11rb::NONE && selection.owner != *selection.window {
-                // A real X clients selection went away, not our proxy
-                selection.pending_transfers.lock().unwrap().clear();
-                let stuck: Vec<X11Window> = selection
-                    .incoming
-                    .iter()
-                    .filter(|(_, t)| t.incr && !t.incr_done)
-                    .map(|(w, _)| *w)
-                    .collect();
-                for w in stuck {
-                    if let Some(transfer) = selection.incoming.remove(&w) {
-                        transfer.destroy(loop_handle);
-                    }
-                }
                 let gone = n.subtype != x11rb::protocol::xfixes::SelectionEvent::SET_SELECTION_OWNER;
                 let selection = selection.type_().unwrap();
                 drop(_guard);
@@ -1992,13 +2041,14 @@ where
                             xwm.atoms._WL_SELECTION,
                             AtomEnum::ANY,
                             0,
-                            4096,
+                            TARGETS_MAX as u32,
                         )?
                         .reply_unchecked()?
                     {
                         if prop.type_ == AtomEnum::ATOM.into() {
                             if let Some(values) = prop.value32() {
                                 let mime_types = values
+                                    .take(TARGETS_MAX)
                                     .filter_map(|val| match val {
                                         val if val == xwm.atoms.TARGETS || val == xwm.atoms.TIMESTAMP => None,
                                         val => mime_from_atom(val, &conn, &xwm.atoms).transpose(),
@@ -2092,7 +2142,7 @@ where
                             xwm.atoms._WL_SELECTION,
                             AtomEnum::ANY,
                             0,
-                            0x1fffffff,
+                            TRANSFER_WORDS_MAX,
                         )?
                         .reply_unchecked()?
                     {
@@ -2100,6 +2150,11 @@ where
                         if type_ == xwm.atoms.INCR {
                             transfer.incr = true;
                             return Ok(());
+                        } else if prop.bytes_after > 0 {
+                            warn!("A selection of more than 16 MB in one piece is not carried");
+                            if let Some(transfer) = selection.incoming.remove(&n.requestor) {
+                                transfer.destroy(loop_handle);
+                            }
                         } else if transfer.token.is_some() {
                             transfer.read_selection_prop(prop);
                             let _ = loop_handle.enable(transfer.token.as_ref().unwrap());
@@ -2219,6 +2274,13 @@ where
                             return Ok(());
                         }
 
+                        let again = selection.outgoing.contains_key(&n.requestor);
+                        if !again && selection.outgoing.len() >= TRANSFERS_MAX {
+                            warn!("Too many transfers to X11 clients wait, this one is refused");
+                            send_selection_notify_resp(&conn, &n, false)?;
+                            return Ok(());
+                        }
+
                         let (recv_fd, send_fd) = rustix::pipe::pipe_with(
                             rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
                         )
@@ -2258,8 +2320,12 @@ where
                                     match read_selection_callback(&xwm.conn, &xwm.atoms, fd.as_fd(), transfer)
                                     {
                                         Ok(OutgoingAction::WaitForReadable) => {
-                                            return Ok(PostAction::Continue);
-                                        } // transfer ongoing
+                                            let full = transfer.source_data.len() >= TRANSFER_HELD_MAX;
+                                            return Ok(match full && transfer.property_set {
+                                                true => PostAction::Disable,
+                                                false => PostAction::Continue,
+                                            });
+                                        }
                                         Ok(OutgoingAction::Done) => {
                                             let _ = transfer.token.take();
                                             selection.outgoing.remove(&requestor);
@@ -2341,11 +2407,14 @@ where
                                 xwm.atoms._WL_SELECTION,
                                 AtomEnum::ANY,
                                 0,
-                                0x1fffffff,
+                                TRANSFER_WORDS_MAX,
                             )?
                             .reply_unchecked()?
                         {
-                            if prop.value_len == 0 {
+                            if prop.bytes_after > 0 {
+                                warn!("A selection piece of more than 16 MB is not carried");
+                                selection.incoming.remove(&n.window).unwrap().destroy(loop_handle);
+                            } else if prop.value_len == 0 {
                                 debug!(?transfer, "Incr Transfer complete!");
                                 if transfer.source_data.is_empty() {
                                     selection.incoming.remove(&n.window).unwrap().destroy(loop_handle);
@@ -2403,6 +2472,14 @@ where
                         let len = transfer.flush_data()?;
                         let requestor = transfer.request.requestor;
                         trace!(requestor, len, "Send data chunk");
+                        if let Some(token) = transfer.token.as_ref() {
+                            if len >= selection::INCR_CHUNK_SIZE {
+                                transfer.flush_property_on_delete = true;
+                            }
+                            if len < TRANSFER_HELD_MAX {
+                                let _ = loop_handle.enable(token);
+                            }
+                        }
 
                         if transfer.token.is_none() {
                             if len > 0 || !transfer.sent_finished {
@@ -2523,7 +2600,9 @@ where
                                 "no matching wl_surface for X11 window",
                             );
                             let xwm = state.xwm_state(xwm_id);
-                            xwm.unpaired_surfaces.insert(serial, xsurface.window_id());
+                            let id = xsurface.window_id();
+                            xwm.unpaired_surfaces.retain(|_, w| *w != id);
+                            xwm.unpaired_surfaces.insert(serial, id);
                             std::mem::drop(guard);
                             xsurface.set_wl_surface(state, None);
                         }
@@ -2905,9 +2984,26 @@ fn atom_from_mime(
     Ok(match mime.as_ref() {
         "text/plain" => Some(atoms.TEXT),
         "text/plain;charset=utf-8" => Some(atoms.UTF8_STRING),
+        mime if mime.len() > MIME_BYTES_MAX => None,
         mime => conn
-            .intern_atom(false, mime.as_bytes())?
+            .intern_atom(!is_mime_kept(mime), mime.as_bytes())?
             .reply_unchecked()?
-            .map(|reply| reply.atom),
+            .map(|reply| reply.atom)
+            .filter(|atom| *atom != x11rb::NONE),
     })
+}
+
+fn is_mime_kept(mime: &str) -> bool {
+    let mut names = match MIME_NAMES.lock() {
+        Ok(n) => n,
+        Err(e) => e.into_inner(),
+    };
+    if names.iter().any(|n| n == mime) {
+        return true;
+    }
+    if names.len() >= MIME_NAMES_MAX {
+        return false;
+    }
+    names.push(String::from(mime));
+    true
 }

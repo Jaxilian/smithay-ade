@@ -1668,7 +1668,7 @@ impl X11Surface {
                 self.atoms._MOTIF_WM_HINTS,
                 AtomEnum::ANY,
                 0,
-                2048,
+                5,
             )?
             .reply_unchecked()
         {
@@ -1768,7 +1768,7 @@ impl X11Surface {
                 self.atoms.WM_PROTOCOLS,
                 AtomEnum::ATOM,
                 0,
-                2048,
+                super::ATOMS_MAX,
             )?
             .reply_unchecked()
         {
@@ -1852,7 +1852,7 @@ impl X11Surface {
                 AtomEnum::WM_TRANSIENT_FOR,
                 AtomEnum::WINDOW,
                 0,
-                2048,
+                1,
             )?
             .reply_unchecked()
         {
@@ -1890,7 +1890,7 @@ impl X11Surface {
                 self.atoms._NET_WM_WINDOW_TYPE,
                 AtomEnum::ATOM,
                 0,
-                1024,
+                super::ATOMS_MAX,
             )?
             .reply_unchecked()
         {
@@ -1909,7 +1909,7 @@ impl X11Surface {
     fn read_window_property_string(&self, atom: impl Into<Atom>) -> Result<Option<String>, ConnectionError> {
         let conn = self.conn.upgrade().ok_or(ConnectionError::UnknownError)?;
         let reply = match conn
-            .get_property(false, self.window, atom, AtomEnum::ANY, 0, 2048)?
+            .get_property(false, self.window, atom, AtomEnum::ANY, 0, super::TEXT_WORDS_MAX)?
             .reply_unchecked()
         {
             Ok(Some(reply)) => reply,
@@ -2511,7 +2511,7 @@ fn fetch_opaque_regions(
     client_scale: Option<&Arc<AtomicF64>>,
 ) -> Result<Option<RegionAttributes>, ConnectionError> {
     let reply = conn
-        .get_property(false, window, property_atom, AtomEnum::CARDINAL, 0, u32::MAX)?
+        .get_property(false, window, property_atom, AtomEnum::CARDINAL, 0, super::OPAQUE_WORDS_MAX)?
         .reply_unchecked()?;
 
     let opaque_region = reply

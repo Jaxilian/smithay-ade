@@ -3,7 +3,10 @@ use std::{
     fmt,
     os::fd::{BorrowedFd, OwnedFd},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
+
+pub const STALL: Duration = Duration::from_secs(30);
 
 use calloop::{LoopHandle, RegistrationToken};
 use tracing::{debug, trace, warn};
@@ -43,6 +46,7 @@ pub struct XWmSelection {
     pub timestamp: u32,
 
     pub pending_transfers: Arc<Mutex<HashMap<X11Window, (OwnedX11Window, OwnedFd)>>>,
+    pub pending_since: HashMap<X11Window, (Instant, u64)>,
     pub incoming: HashMap<X11Window, IncomingTransfer>,
     pub outgoing: HashMap<X11Window, OutgoingTransfer>,
 }
@@ -54,6 +58,8 @@ pub struct IncomingTransfer {
     pub incr: bool,
     pub source_data: Vec<u8>,
     pub incr_done: bool,
+    pub touched: Instant,
+    pub who: u64,
 }
 
 impl fmt::Debug for IncomingTransfer {
@@ -70,6 +76,7 @@ impl fmt::Debug for IncomingTransfer {
 
 impl IncomingTransfer {
     pub fn read_selection_prop(&mut self, reply: GetPropertyReply) {
+        self.touched = Instant::now();
         self.source_data.extend(&reply.value)
     }
 
@@ -79,6 +86,9 @@ impl IncomingTransfer {
         }
 
         let len = rustix::io::write(fd, &self.source_data)?;
+        if len > 0 {
+            self.touched = Instant::now();
+        }
         self.source_data = self.source_data.split_off(len);
 
         Ok(self.source_data.is_empty())
@@ -112,8 +122,9 @@ pub struct OutgoingTransfer {
 
     pub property_set: bool,
     pub flush_property_on_delete: bool,
-    /// The final 0-byte data chunk has been sent, denoting the completion of this transfer
     pub sent_finished: bool,
+    pub touched: Instant,
+    pub who: u64,
 }
 
 impl fmt::Debug for OutgoingTransfer {
@@ -152,6 +163,7 @@ impl OutgoingTransfer {
         self.conn.flush()?;
 
         let remaining = self.source_data.len();
+        self.touched = Instant::now();
         self.property_set = true;
         Ok(remaining)
     }
@@ -223,6 +235,7 @@ impl XWmSelection {
             mime_types: Vec::new(),
             timestamp: x11rb::CURRENT_TIME,
             pending_transfers: Arc::new(Mutex::new(HashMap::new())),
+            pending_since: HashMap::new(),
             incoming: HashMap::new(),
             outgoing: HashMap::new(),
         })
@@ -240,6 +253,77 @@ impl XWmSelection {
         } else {
             false
         }) || self.pending_transfers.lock().unwrap().remove(window).is_some()
+    }
+
+    pub fn held_for(&self, who: u64) -> (usize, usize) {
+        let waiting = self.pending_since.values().filter(|(_, w)| *w == who);
+        let reading = self.incoming.values().filter(|t| t.who == who);
+        let writing = self.outgoing.values().filter(|t| t.who == who);
+
+        (waiting.count() + reading.count(), writing.count())
+    }
+
+    pub fn end_stalled<D>(&mut self, handle: &LoopHandle<'_, D>, now: Instant) -> usize {
+        let is_late = |t: Instant| now.saturating_duration_since(t) >= STALL;
+        let mut ended = 0;
+
+        {
+            let mut pending = self.pending_transfers.lock().unwrap();
+            self.pending_since.retain(|w, _| pending.contains_key(w));
+            let late: Vec<X11Window> = self
+                .pending_since
+                .iter()
+                .filter(|(_, (t, _))| is_late(*t))
+                .map(|(w, _)| *w)
+                .collect();
+            for w in late {
+                pending.remove(&w);
+                self.pending_since.remove(&w);
+                ended += 1;
+            }
+        }
+
+        let late: Vec<X11Window> = self
+            .incoming
+            .iter()
+            .filter(|(_, t)| is_late(t.touched))
+            .map(|(w, _)| *w)
+            .collect();
+        for w in late {
+            if let Some(transfer) = self.incoming.remove(&w) {
+                transfer.destroy(handle);
+                ended += 1;
+            }
+        }
+
+        let late: Vec<X11Window> = self
+            .outgoing
+            .iter()
+            .filter(|(_, t)| is_late(t.touched))
+            .map(|(w, _)| *w)
+            .collect();
+        for w in late {
+            let Some(transfer) = self.outgoing.remove(&w) else {
+                continue;
+            };
+            let req = transfer.request;
+            if transfer.incr {
+                let _ = transfer.conn.change_property8(
+                    PropMode::REPLACE,
+                    req.requestor,
+                    req.property,
+                    req.target,
+                    &[],
+                );
+            } else {
+                let _ = send_selection_notify_resp(&transfer.conn, &req, false);
+            }
+            let _ = transfer.conn.flush();
+            transfer.destroy(handle);
+            ended += 1;
+        }
+
+        ended
     }
 
     pub fn has_window(&self, window: &X11Window) -> bool {
@@ -283,6 +367,9 @@ pub fn read_selection_callback(
         "Transfer became readable, read {} bytes", len
     );
 
+    if len > 0 {
+        transfer.touched = Instant::now();
+    }
     transfer.source_data.extend_from_slice(&buf[..len]);
     if transfer.source_data.len() >= INCR_CHUNK_SIZE {
         if !transfer.incr {

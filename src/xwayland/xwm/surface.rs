@@ -1923,7 +1923,16 @@ impl X11Surface {
 
         match reply.type_ {
             x if x == AtomEnum::STRING.into() => Ok(Some(WINDOWS_1252.decode(&bytes).0.to_string())),
-            x if x == self.atoms.UTF8_STRING => Ok(String::from_utf8(bytes).ok()),
+            x if x == self.atoms.UTF8_STRING => Ok(match String::from_utf8(bytes) {
+                Ok(text) => Some(text),
+                Err(e) if reply.bytes_after > 0 && e.utf8_error().error_len().is_none() => {
+                    let whole = e.utf8_error().valid_up_to();
+                    let mut bytes = e.into_bytes();
+                    bytes.truncate(whole);
+                    String::from_utf8(bytes).ok()
+                }
+                Err(_) => None,
+            }),
             _ => Ok(None),
         }
     }

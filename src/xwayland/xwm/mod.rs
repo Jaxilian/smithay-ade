@@ -592,6 +592,11 @@ pub trait XwmHandler {
 
     /// WM has lost connection to X server
     fn disconnected(&mut self, _xwm: XwmId) {}
+
+    /// The app an X11 client belongs to, from the pid the X server saw: 0 for one that shares with nobody
+    fn client_key(&mut self, _xwm: XwmId, _pid: Option<u32>) -> u64 {
+        0
+    }
 }
 
 /// The runtime state of an reparenting XWayland window manager.
@@ -622,6 +627,7 @@ pub struct X11Wm {
     client_list: Vec<X11Window>,
     // bottom -> top
     client_list_stacking: Vec<X11Window>,
+    clients: HashMap<u32, (u64, usize)>,
 
     is_showing_desktop: bool,
 
@@ -698,9 +704,11 @@ pub enum ResizeEdge {
     BottomRight,
 }
 
-pub(crate) const WINDOWS_MAX: usize = 2048;
+pub(crate) const WINDOWS_MAX: usize = 8192;
 pub(crate) const WINDOWS_CLIENT_MAX: usize = 512;
-pub(crate) const TRANSFERS_MAX: usize = 8;
+pub(crate) const CLIENTS_MAX: usize = 2048;
+pub(crate) const TRANSFERS_MAX: usize = 16;
+pub(crate) const TRANSFERS_APP_MAX: usize = 4;
 pub(crate) const TRANSFER_WORDS_MAX: u32 = 1 << 22;
 pub(crate) const TRANSFER_HELD_MAX: usize = 4 * selection::INCR_CHUNK_SIZE;
 pub(crate) const TARGETS_MAX: usize = 256;
@@ -710,7 +718,9 @@ pub(crate) const OPAQUE_WORDS_MAX: u32 = 1024;
 pub(crate) const MIME_NAMES_MAX: usize = 1024;
 pub(crate) const MIME_BYTES_MAX: usize = 256;
 
-static MIME_NAMES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+pub(crate) const MIME_SERVERS_MAX: usize = 8;
+
+static MIME_NAMES: std::sync::Mutex<Vec<(usize, Vec<String>)>> = std::sync::Mutex::new(Vec::new());
 
 /// Errors generated working with Xwm Selections
 #[derive(thiserror::Error, Debug)]
@@ -1036,6 +1046,11 @@ impl X11Wm {
         }
         conn.xfixes_query_version(1, 0)?.reply_unchecked()?; // we just need version 1 for clipboard monitoring
 
+        let at = Arc::as_ptr(&conn) as usize;
+        match MIME_NAMES.lock() {
+            Ok(mut names) => names.retain(|(of, _)| *of != at),
+            Err(e) => e.into_inner().retain(|(of, _)| *of != at),
+        }
         let clipboard = XWmSelection::new(&conn, &screen, &atoms, atoms.CLIPBOARD)?;
         let primary = XWmSelection::new(&conn, &screen, &atoms, atoms.PRIMARY)?;
         let dnd = XWmDnd::new(&conn, &screen, &atoms)?;
@@ -1068,6 +1083,7 @@ impl X11Wm {
             windows: Vec::new(),
             client_list: Vec::new(),
             client_list_stacking: Vec::new(),
+            clients: HashMap::new(),
             is_showing_desktop: false,
             focus_release,
             span,
@@ -1353,12 +1369,22 @@ impl X11Wm {
         Ok(())
     }
 
+    /// Ends the transfers that moved nothing for 30 s; `now` is the time to judge them at
+    pub fn end_stalled<D>(&mut self, handle: &LoopHandle<'_, D>, now: std::time::Instant) -> usize {
+        let sels = [&mut self.clipboard, &mut self.primary, &mut self.dnd.selection];
+
+        sels.into_iter().map(|s| s.end_stalled(handle, now)).sum()
+    }
+
     /// Request to transfer the active `selection` for the provided `mime_type` to the provided file descriptor.
+    ///
+    /// `who` is the app that reads, 0 for one that shares with nobody.
     pub fn send_selection(
         &mut self,
         selection_type: SelectionTarget,
         mime_type: String,
         fd: OwnedFd,
+        who: u64,
     ) -> Result<(), SelectionError> {
         let selection = match selection_type {
             SelectionTarget::Clipboard => &mut self.clipboard,
@@ -1377,7 +1403,8 @@ impl X11Wm {
         debug!("Mime-type {:?} / Atom {:?}", mime_type, atom);
 
         let waiting = selection.pending_transfers.lock().unwrap().len();
-        if waiting + selection.incoming.len() >= TRANSFERS_MAX {
+        let (mine, _) = selection.held_for(who);
+        if waiting + selection.incoming.len() >= TRANSFERS_MAX || (who != 0 && mine >= TRANSFERS_APP_MAX) {
             return Err(SelectionError::TooManyTransfers);
         }
 
@@ -1412,6 +1439,9 @@ impl X11Wm {
             incoming_window,
             (OwnedX11Window::new(incoming_window, &self.conn), fd),
         );
+        selection
+            .pending_since
+            .insert(incoming_window, (std::time::Instant::now(), who));
         Ok(())
     }
 
@@ -1618,12 +1648,16 @@ where
                 return Ok(());
             }
 
-            let mask = conn.setup().resource_id_mask;
+            drop(_guard);
+            let (base, key) = key_of(state, xwm_id, &conn, n.window);
+            let xwm = state.xwm_state(xwm_id);
+            let _guard = xwm.span.enter();
             let mine = xwm
-                .windows
+                .clients
                 .iter()
-                .filter(|s| s.window_id() & !mask == n.window & !mask)
-                .count();
+                .filter(|(b, (k, _))| **b == base || (key != 0 && *k == key))
+                .map(|(_, (_, held))| *held)
+                .sum::<usize>();
             if xwm.windows.len() >= WINDOWS_MAX || mine >= WINDOWS_CLIENT_MAX {
                 warn!(window = n.window, "Too many X11 windows, this one is not managed");
                 return Ok(());
@@ -1666,6 +1700,7 @@ where
             );
             surface.update_properties()?;
             xwm.windows.push(surface.clone());
+            xwm.clients.entry(base).or_insert((key, 0)).1 += 1;
 
             drop(_guard);
             if n.override_redirect {
@@ -1968,6 +2003,13 @@ where
 
             if let Some(pos) = xwm.windows.iter().position(|x| x.window_id() == n.window) {
                 let surface = xwm.windows.remove(pos);
+                let base = n.window & !conn.setup().resource_id_mask;
+                if let Some((_, held)) = xwm.clients.get_mut(&base) {
+                    *held = held.saturating_sub(1);
+                    if *held == 0 {
+                        xwm.clients.remove(&base);
+                    }
+                }
                 surface.handle_destroyed();
                 drop(_guard);
                 state.destroyed_window(xwm_id, surface);
@@ -1986,6 +2028,7 @@ where
             };
 
             selection.pending_transfers.lock().unwrap().clear();
+            selection.pending_since.clear();
             let stuck: Vec<X11Window> = selection
                 .incoming
                 .iter()
@@ -2074,6 +2117,7 @@ where
                         transfer
                     } else {
                         // create incoming transfer
+                        let who = selection.pending_since.remove(&n.requestor).map_or(0, |(_, w)| w);
                         let Some((window, fd)) =
                             selection.pending_transfers.lock().unwrap().remove(&n.requestor)
                         else {
@@ -2130,6 +2174,8 @@ where
                             incr: false,
                             source_data: Vec::new(),
                             incr_done: false,
+                            touched: std::time::Instant::now(),
+                            who,
                         };
                         selection.incoming.insert(incoming_window, transfer);
                         selection.incoming.get_mut(&incoming_window).unwrap()
@@ -2185,6 +2231,7 @@ where
             let allow_access = selection_type
                 .map(|type_| state.allow_selection_access(xwm_id, type_))
                 .unwrap_or(true);
+            let (_, who) = key_of(state, xwm_id, &conn, n.requestor);
 
             let xwm = state.xwm_state(xwm_id);
             let selection = match n.selection {
@@ -2275,7 +2322,10 @@ where
                         }
 
                         let again = selection.outgoing.contains_key(&n.requestor);
-                        if !again && selection.outgoing.len() >= TRANSFERS_MAX {
+                        let (_, mine) = selection.held_for(who);
+                        let full = selection.outgoing.len() >= TRANSFERS_MAX
+                            || (who != 0 && mine >= TRANSFERS_APP_MAX);
+                        if !again && full {
                             warn!("Too many transfers to X11 clients wait, this one is refused");
                             send_selection_notify_resp(&conn, &n, false)?;
                             return Ok(());
@@ -2369,6 +2419,8 @@ where
                             property_set: false,
                             flush_property_on_delete: false,
                             sent_finished: false,
+                            touched: std::time::Instant::now(),
+                            who,
                         };
                         selection.outgoing.insert(n.requestor, transfer);
 
@@ -2978,26 +3030,37 @@ fn mime_from_atom(
 
 fn atom_from_mime(
     mime: &(impl AsRef<str> + ?Sized),
-    conn: &impl ConnectionExt,
+    conn: &RustConnection,
     atoms: &Atoms,
 ) -> Result<Option<u32>, ConnectionError> {
+    let at = conn as *const RustConnection as usize;
     Ok(match mime.as_ref() {
         "text/plain" => Some(atoms.TEXT),
         "text/plain;charset=utf-8" => Some(atoms.UTF8_STRING),
         mime if mime.len() > MIME_BYTES_MAX => None,
         mime => conn
-            .intern_atom(!is_mime_kept(mime), mime.as_bytes())?
+            .intern_atom(!is_mime_kept(at, mime), mime.as_bytes())?
             .reply_unchecked()?
             .map(|reply| reply.atom)
             .filter(|atom| *atom != x11rb::NONE),
     })
 }
 
-fn is_mime_kept(mime: &str) -> bool {
-    let mut names = match MIME_NAMES.lock() {
+fn is_mime_kept(at: usize, mime: &str) -> bool {
+    let mut servers = match MIME_NAMES.lock() {
         Ok(n) => n,
         Err(e) => e.into_inner(),
     };
+    if !servers.iter().any(|(of, _)| *of == at) {
+        if servers.len() >= MIME_SERVERS_MAX {
+            servers.remove(0);
+        }
+        servers.push((at, Vec::new()));
+    }
+    let Some((_, names)) = servers.iter_mut().find(|(of, _)| *of == at) else {
+        return false;
+    };
+
     if names.iter().any(|n| n == mime) {
         return true;
     }
@@ -3006,4 +3069,31 @@ fn is_mime_kept(mime: &str) -> bool {
     }
     names.push(String::from(mime));
     true
+}
+
+fn key_of<D: XwmHandler>(state: &mut D, xwm_id: XwmId, conn: &RustConnection, window: X11Window) -> (u32, u64) {
+    let base = window & !conn.setup().resource_id_mask;
+    if let Some((key, held)) = state.xwm_state(xwm_id).clients.get(&base) {
+        if *held > 0 {
+            return (base, *key);
+        }
+    }
+
+    let spec = x11rb::protocol::res::ClientIdSpec {
+        client: window,
+        mask: x11rb::protocol::res::ClientIdMask::LOCAL_CLIENT_PID,
+    };
+    let asked = x11rb::protocol::res::query_client_ids(conn, &[spec]);
+    let reply = asked.ok().and_then(|cookie| cookie.reply().ok());
+    let pid = reply.and_then(|r| r.ids.first().and_then(|id| id.value.first().copied()));
+    let key = state.client_key(xwm_id, pid);
+
+    let clients = &mut state.xwm_state(xwm_id).clients;
+    if clients.len() >= CLIENTS_MAX {
+        clients.retain(|_, (_, held)| *held > 0);
+    }
+    if clients.len() < CLIENTS_MAX {
+        clients.insert(base, (key, 0));
+    }
+    (base, key)
 }
